@@ -137,6 +137,11 @@ info "Log: $LOG_FILE"
 TS_AUTH_KEY="$(cat "$TAILSCALE_AUTHKEY_FILE" 2>/dev/null || true)"
 
 # --- Helper: Cloudflare API response check (used later) ---------------------
+# Every Cloudflare API response is JSON with a top-level "success" boolean.
+# Reads that response from stdin: exits 0 silently if success=true, otherwise
+# prints Cloudflare's own error message and exits 1. Used as the condition of
+# an `if` below on purpose — that's the one place a non-zero exit doesn't
+# trigger `set -e` and kill the whole script.
 cf_check_success() {
   python3 -c "
 import json, sys
@@ -159,6 +164,8 @@ sys.exit(1)
 find_next_ip() {
   local prefix="$1"
   if [[ -n "$PFSENSE_HOST" ]]; then
+    # Optional path: ask the router directly (only runs if you filled in
+    # PFSENSE_HOST and wrote your own find-next-ip.php on that router).
     local ip
     ip=$(ssh -n -i "${PFSENSE_KEY}" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
       "${PFSENSE_USER}@${PFSENSE_HOST}" \
@@ -169,6 +176,9 @@ find_next_ip() {
     fi
     warn "Router lookup failed or not configured — falling back to ping sweep."
   fi
+  # Default path: try each address in the configured range and pick the
+  # first one that doesn't answer a single ping. Not 100% reliable (a
+  # powered-off device would look "free" too) but needs zero setup.
   for i in $(seq "$IP_SCAN_RANGE_START" "$IP_SCAN_RANGE_END"); do
     local candidate="${prefix}.${i}"
     if ! ping -c1 -W1 "$candidate" >/dev/null 2>&1; then
@@ -302,24 +312,36 @@ if qm status "$VMID" >/dev/null 2>&1; then
 fi
 
 # --- 6. Clone the template -----------------------------------------------------
+# "--full" makes an independent copy of the disk instead of a linked clone —
+# slower to create, but the new VM doesn't stay tied to the template forever.
 step "Cloning template $TEMPLATE_ID -> VM $VMID ($VM_NAME) ..."
 qm clone "$TEMPLATE_ID" "$VMID" --name "$VM_NAME" --full --storage "$TARGET_STORAGE" &
 spin "Cloning template, this takes a minute..."
 wait $!
 ok "Cloned — VMID $VMID"
 
+# Templates are usually built small (a few GB) to keep cloning fast — grow
+# the actual VM's disk up to what was asked for. scsi0 is the boot disk slot.
 step "Resizing disk to $DISK_SIZE"
 qm resize "$VMID" scsi0 "$DISK_SIZE"
 ok "Disk resized"
 
 # --- 7. Set the NIC -------------------------------------------------------------
+# Re-attaching net0 makes sure the VM lands on the right bridge — the cloned
+# template might have been built against a different one.
 qm set "$VMID" --net0 "virtio,bridge=${BRIDGE}"
 
 # --- 8. Grab the MAC address (after the NIC reset, otherwise it's stale) -------
+# Proxmox generates a MAC when net0 is (re)created; we need it below for the
+# optional DHCP reservation, so it has to be read back after step 7, not before.
 VM_MAC=$(qm config "$VMID" | grep '^net0:' | grep -oP '(?:virtio|e1000)=\K[^,]+')
 info "MAC: $VM_MAC"
 
 # --- 9. Make sure snippet storage is enabled -----------------------------------
+# Cloud-init config gets written as "snippet" files (plain YAML) that live on
+# a storage pool. Most fresh Proxmox installs don't have the "snippets"
+# content type turned on for local storage by default — this checks for it
+# and enables it if missing, without touching any other settings on the pool.
 if ! grep -A6 "^dir: ${SNIPPET_STORAGE}$" /etc/pve/storage.cfg | grep -q "snippets"; then
   CURRENT_CONTENT=$(pvesh get "/storage/${SNIPPET_STORAGE}" --output-format json \
     | grep -o '"content":"[^"]*"' | cut -d'"' -f4)
@@ -328,10 +350,16 @@ fi
 mkdir -p "$SNIPPET_DIR"
 
 # --- 10. Build cloud-init user-data (keyboard + SSH key + no cleartext pw) -----
+# cloud-init reads two files on first boot: "user-data" (accounts, packages,
+# commands to run) and "network-data" (built in the next step). We generate
+# both as plain YAML and hand them to the VM via --cicustom below.
 USER_SNIPPET="userdata-${VMID}.yaml"
 step "Building cloud-init configuration"
 {
-  # SHA-512 hash for cloud-init — no cleartext password is ever stored anywhere.
+  # openssl passwd -6 makes a SHA-512 crypt hash — this is what goes into the
+  # YAML, never the plaintext password. cloud-init accepts pre-hashed
+  # passwords under the "passwd" key, so the plaintext only exists in this
+  # script's own memory for the few milliseconds it takes to hash it.
   HASHED_PW=$(openssl passwd -6 "${PASSWORD}")
 
   echo "#cloud-config"
@@ -347,6 +375,9 @@ step "Building cloud-init configuration"
   echo "    shell: /bin/bash"
   echo "    groups: [sudo, adm]"
   if [[ -f /root/.ssh/authorized_keys ]]; then
+    # Copy every key already trusted for root on THIS Proxmox host into the
+    # new VM. Whoever runs this script ends up with their own key on every
+    # VM it creates — nobody else's.
     echo "    ssh_authorized_keys:"
     while IFS= read -r key; do
       [[ -z "$key" || "$key" == \#* ]] && continue
@@ -358,6 +389,8 @@ step "Building cloud-init configuration"
   if [[ -n "$LAB_EXTRA_PKGS" ]]; then
     for pkg in $LAB_EXTRA_PKGS; do echo "  - ${pkg}"; done
   fi
+  # Passwordless sudo for the new user — convenient for a throwaway lab VM,
+  # but think twice before doing this on anything long-lived or shared.
   echo "write_files:"
   echo "  - path: /etc/sudoers.d/${USERNAME}"
   echo "    content: \"${USERNAME} ALL=(ALL) NOPASSWD:ALL\\n\""
@@ -375,6 +408,10 @@ step "Building cloud-init configuration"
 ok "user-data snippet written"
 
 # --- 11. Build cloud-init network-data (static IP) ------------------------------
+# "Network Config Version 2" format (Netplan-style). match: name "en*" targets
+# whatever the first ethernet interface is called — cloud images name NICs
+# unpredictably (enp0s3, ens18, etc.) depending on the hypervisor, so we match
+# by pattern instead of a fixed name.
 NET_SNIPPET="network-${VMID}.yaml"
 step "Building cloud-init network config: ${NEXT_IP}/24 via ${GATEWAY}"
 cat > "${SNIPPET_DIR}/${NET_SNIPPET}" <<EOF
@@ -395,6 +432,13 @@ EOF
 ok "network-data snippet written"
 
 # --- 12. Wire up cloud-init ------------------------------------------------------
+# --cicustom points the VM at the two snippet files we just wrote instead of
+# Proxmox's own built-in cloud-init form — that's what lets us fully control
+# the YAML (SSH keys, packages, runcmd) rather than being limited to the few
+# fields the Proxmox GUI/API expose directly.
+# Deliberately NOT using --cipassword here: it would write the plaintext
+# password straight into the VM's config file (visible via `qm config`).
+# The SHA-512 hash inside userdata.yaml is the only copy of the password.
 step "Configuring cloud-init"
 qm set "$VMID" --ciuser "$USERNAME"
 qm set "$VMID" --nameserver "$DNS_SERVER"
@@ -407,6 +451,9 @@ step "Registering DHCP reservation (skipped automatically if not configured)"
 register_dhcp_reservation "$SELECTED_IFACE" "$NEXT_IP" "$VM_NAME" "$VM_MAC"
 
 # --- 14. Snapshot (clean rollback point) ------------------------------------------
+# A snapshot taken right after first boot, before you've touched anything —
+# handy for a school lab where you'll deliberately break things and want an
+# instant "undo everything" button instead of rebuilding from scratch.
 step "Taking snapshot 'clean'"
 qm snapshot "$VMID" clean --description "Clean state created by new-vm.sh"
 ok "Snapshot done (rollback: qm rollback $VMID clean)"
@@ -443,6 +490,10 @@ if [[ -n "${CF_API_TOKEN:-}" ]]; then
       -H "Authorization: Bearer ${CF_API_TOKEN}" || true)
 
     if [[ -n "$CURRENT_CONFIG" ]] && CONFIG_ERR=$(printf '%s' "$CURRENT_CONFIG" | cf_check_success); then
+      # Rebuild the ingress list: drop any existing rule for this hostname
+      # first (so re-running the script updates it instead of duplicating
+      # it), then insert the new rule second-to-last — Cloudflare requires
+      # the very last ingress rule to be a catch-all with no hostname.
       NEW_INGRESS=$(printf '%s' "$CURRENT_CONFIG" | python3 -c "
 import json, sys
 d = json.loads(sys.stdin.read())
