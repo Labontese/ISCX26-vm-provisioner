@@ -54,13 +54,18 @@ TEMPLATE_3_ID=9000; TEMPLATE_3_LABEL="24.04 LTS Noble Numbat"
 TEMPLATE_4_ID=9001; TEMPLATE_4_LABEL="26.04 LTS Resolute Raccoon (standard)"
 DEFAULT_TEMPLATE_CHOICE=4
 
-# Your subnets: interface name -> "network prefix" and "gateway". Add more
-# pairs if you have several VLANs; a single flat network only needs one.
-declare -A IFACE_PREFIX=( [lan]="192.168.1" )
-declare -A IFACE_GW=(     [lan]="192.168.1.1" )
-DEFAULT_IFACE="lan"
-IP_SCAN_RANGE_START=100                 # ping-sweep range for a free IP
-IP_SCAN_RANGE_END=250
+# Your networks: one entry per VLAN/subnet you want to offer in the menu.
+# Format:  [name]="vlan_tag:cidr:gateway"
+#   - vlan_tag: the VLAN ID if this network is tagged on a trunk bridge,
+#     or leave it empty for an untagged/flat network (e.g. "" or "0").
+#   - cidr: the network in CIDR form — any prefix length works, not just /24.
+#     The free-IP ping sweep and the cloud-init prefix are both derived from
+#     this automatically (a /27 gets scanned/scoped differently than a /24).
+#   - gateway: usually the router's address in that subnet.
+declare -A NETWORKS=(
+  [lan]=":192.168.1.0/24:192.168.1.1"
+)
+DEFAULT_NETWORK="lan"
 
 # --- Optional: router integration for a more accurate IP + auto DHCP reservation ---
 # Leave PFSENSE_HOST empty to skip this entirely and rely on the ping sweep.
@@ -158,29 +163,58 @@ sys.exit(1)
 "
 }
 
+# --- Helpers: IPv4 <-> integer, for real CIDR math (any prefix, not just /24) -
+# Bash's $(( )) does 64-bit arithmetic, so a 32-bit address fits with room to
+# spare — no bc/python needed just to add "how big is this subnet" together.
+ip_to_int() {
+  local IFS=.; local -a o; read -r -a o <<< "$1"
+  echo $(( (o[0]<<24) + (o[1]<<16) + (o[2]<<8) + o[3] ))
+}
+int_to_ip() {
+  local ip=$1
+  echo "$(( (ip>>24)&255 )).$(( (ip>>16)&255 )).$(( (ip>>8)&255 )).$(( ip&255 ))"
+}
+# Splits "10.10.70.0/27" into three globals: CIDR_NETWORK_INT, CIDR_PREFIX,
+# CIDR_FIRST_USABLE_INT, CIDR_LAST_USABLE_INT. Same formula regardless of
+# whether the prefix is /24, /27, or anything else — this is exactly the
+# network/broadcast math from subnetting, just done once in code instead of
+# by hand.
+parse_cidr() {
+  local addr="${1%/*}" prefix="${1#*/}"
+  local mask=$(( prefix == 0 ? 0 : (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+  CIDR_PREFIX="$prefix"
+  CIDR_NETWORK_INT=$(( $(ip_to_int "$addr") & mask ))
+  local broadcast_int=$(( CIDR_NETWORK_INT | (~mask & 0xFFFFFFFF) ))
+  CIDR_FIRST_USABLE_INT=$(( CIDR_NETWORK_INT + 1 ))
+  CIDR_LAST_USABLE_INT=$(( broadcast_int - 1 ))
+}
+
 # --- Helper: find a free IP -------------------------------------------------
-# Default: simple ping sweep. Swap in a call to your router's API here if you
-# want something more accurate than "doesn't respond to ping right now".
+# Default: simple ping sweep across the subnet's actual usable range (derived
+# from its real prefix length — a /27 only gets 30 addresses checked, not the
+# 256 you'd assume from a /24). Swap in a call to your router's API here if
+# you want something more accurate than "doesn't respond to ping right now".
 find_next_ip() {
-  local prefix="$1"
   if [[ -n "$PFSENSE_HOST" ]]; then
     # Optional path: ask the router directly (only runs if you filled in
     # PFSENSE_HOST and wrote your own find-next-ip.php on that router).
     local ip
     ip=$(ssh -n -i "${PFSENSE_KEY}" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
       "${PFSENSE_USER}@${PFSENSE_HOST}" \
-      "/usr/local/bin/php /home/prox/find-next-ip.php '${SELECTED_IFACE}' '${prefix}'" 2>/dev/null || true)
+      "/usr/local/bin/php /home/prox/find-next-ip.php '${SELECTED_NET}' '${SUBNET_CIDR}'" 2>/dev/null || true)
     if [[ -n "$ip" ]]; then
       echo "$ip"
       return 0
     fi
     warn "Router lookup failed or not configured — falling back to ping sweep."
   fi
-  # Default path: try each address in the configured range and pick the
-  # first one that doesn't answer a single ping. Not 100% reliable (a
-  # powered-off device would look "free" too) but needs zero setup.
-  for i in $(seq "$IP_SCAN_RANGE_START" "$IP_SCAN_RANGE_END"); do
-    local candidate="${prefix}.${i}"
+  # Default path: try each usable address in the subnet and pick the first
+  # one that doesn't answer a single ping. Not 100% reliable (a powered-off
+  # device would look "free" too) but needs zero setup. The gateway address
+  # itself will answer, so it's naturally skipped without special-casing it.
+  local i
+  for (( i = CIDR_FIRST_USABLE_INT; i <= CIDR_LAST_USABLE_INT; i++ )); do
+    local candidate; candidate=$(int_to_ip "$i")
     if ! ping -c1 -W1 "$candidate" >/dev/null 2>&1; then
       echo "$candidate"
       return 0
@@ -194,7 +228,7 @@ register_dhcp_reservation() {
   [[ -z "$PFSENSE_HOST" ]] && return 0
   ssh -n -i "${PFSENSE_KEY}" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
     "${PFSENSE_USER}@${PFSENSE_HOST}" \
-    "/usr/local/bin/php /home/prox/add-dhcp-reservation.php '${SELECTED_IFACE}' '$1' '$2' '$3'" 2>/dev/null \
+    "/usr/local/bin/php /home/prox/add-dhcp-reservation.php '${SELECTED_NET}' '$1' '$2' '$3'" 2>/dev/null \
     && ok "DHCP reservation registered: $3 -> $2 ($1)" \
     || warn "Could not register a DHCP reservation (router integration not set up) — that's fine, the static IP is still configured on the VM itself."
 }
@@ -226,34 +260,38 @@ if ! qm status "$TEMPLATE_ID" >/dev/null 2>&1; then
   exit 1
 fi
 
-# --- 2. Choose subnet ---------------------------------------------------------
+# --- 2. Choose network (VLAN + subnet) -----------------------------------------
 echo
 echo -e "  ${C_WHITE}Network:${C_RST}"
 i=1
-declare -A MENU_IFACE
-for name in "${!IFACE_PREFIX[@]}"; do
-  echo -e "  ${C_DIM}[$i]${C_RST}  $name   ${IFACE_PREFIX[$name]}.x"
-  MENU_IFACE[$i]="$name"
+declare -A MENU_NET
+for name in "${!NETWORKS[@]}"; do
+  IFS=':' read -r _vlan _cidr _gw <<< "${NETWORKS[$name]}"
+  local_vlan_label="untagged"; [[ -n "$_vlan" && "$_vlan" != "0" ]] && local_vlan_label="VLAN $_vlan"
+  echo -e "  ${C_DIM}[$i]${C_RST}  $name   ${_cidr}   ${C_DIM}(${local_vlan_label})${C_RST}"
+  MENU_NET[$i]="$name"
   i=$((i+1))
 done
 read -rp "  Choice [1]: " SUBNET_CHOICE
-SELECTED_IFACE="${MENU_IFACE[${SUBNET_CHOICE:-1}]:-$DEFAULT_IFACE}"
+SELECTED_NET="${MENU_NET[${SUBNET_CHOICE:-1}]:-$DEFAULT_NETWORK}"
 
-if [[ -z "${IFACE_PREFIX[$SELECTED_IFACE]+x}" ]]; then
-  err "Unknown interface '$SELECTED_IFACE' — check the IFACE_PREFIX config."
+if [[ -z "${NETWORKS[$SELECTED_NET]+x}" ]]; then
+  err "Unknown network '$SELECTED_NET' — check the NETWORKS config."
   exit 1
 fi
 
-SUBNET_PREFIX="${IFACE_PREFIX[$SELECTED_IFACE]}"
-GATEWAY="${IFACE_GW[$SELECTED_IFACE]}"
+IFS=':' read -r VLAN_TAG SUBNET_CIDR GATEWAY <<< "${NETWORKS[$SELECTED_NET]}"
+parse_cidr "$SUBNET_CIDR"   # sets CIDR_PREFIX, CIDR_NETWORK_INT, CIDR_FIRST/LAST_USABLE_INT
+USABLE_COUNT=$(( CIDR_LAST_USABLE_INT - CIDR_FIRST_USABLE_INT + 1 ))
+info "Subnet ${SUBNET_CIDR} -> /${CIDR_PREFIX}, ${USABLE_COUNT} usable addresses ($(int_to_ip $CIDR_FIRST_USABLE_INT) - $(int_to_ip $CIDR_LAST_USABLE_INT))"
 
 # --- 3. Find a free IP ---------------------------------------------------------
-step "Looking for a free IP on ${SUBNET_PREFIX}.0/24"
-NEXT_IP=$(find_next_ip "$SUBNET_PREFIX") || { err "Couldn't find a free IP in ${SUBNET_PREFIX}.${IP_SCAN_RANGE_START}-${IP_SCAN_RANGE_END}."; exit 1; }
-info "Suggested IP: ${C_GREEN}$NEXT_IP${C_RST}"
+step "Looking for a free IP in ${SUBNET_CIDR}"
+NEXT_IP=$(find_next_ip) || { err "No free address found in ${SUBNET_CIDR}'s usable range."; exit 1; }
+info "Suggested IP: ${C_GREEN}$NEXT_IP${C_RST}/${CIDR_PREFIX}"
 read -rp "  Use $NEXT_IP? (Y/n): " IP_CONFIRM
 if [[ "${IP_CONFIRM,,}" == "n" ]]; then
-  read -rp "  Enter an IP manually (e.g. ${SUBNET_PREFIX}.150): " NEXT_IP
+  read -rp "  Enter an IP manually (must be inside ${SUBNET_CIDR}): " NEXT_IP
 fi
 
 # --- 4. Interactive prompts ---------------------------------------------------
@@ -328,8 +366,12 @@ ok "Disk resized"
 
 # --- 7. Set the NIC -------------------------------------------------------------
 # Re-attaching net0 makes sure the VM lands on the right bridge — the cloned
-# template might have been built against a different one.
-qm set "$VMID" --net0 "virtio,bridge=${BRIDGE}"
+# template might have been built against a different one. If the chosen
+# network specified a VLAN tag, add it here so the NIC tags its own traffic
+# — the bridge just needs to be a VLAN-aware trunk, no per-VLAN bridge needed.
+NET0="virtio,bridge=${BRIDGE}"
+[[ -n "$VLAN_TAG" && "$VLAN_TAG" != "0" ]] && NET0="${NET0},tag=${VLAN_TAG}"
+qm set "$VMID" --net0 "$NET0"
 
 # --- 8. Grab the MAC address (after the NIC reset, otherwise it's stale) -------
 # Proxmox generates a MAC when net0 is (re)created; we need it below for the
@@ -413,7 +455,7 @@ ok "user-data snippet written"
 # unpredictably (enp0s3, ens18, etc.) depending on the hypervisor, so we match
 # by pattern instead of a fixed name.
 NET_SNIPPET="network-${VMID}.yaml"
-step "Building cloud-init network config: ${NEXT_IP}/24 via ${GATEWAY}"
+step "Building cloud-init network config: ${NEXT_IP}/${CIDR_PREFIX} via ${GATEWAY}"
 cat > "${SNIPPET_DIR}/${NET_SNIPPET}" <<EOF
 version: 2
 ethernets:
@@ -421,7 +463,7 @@ ethernets:
     match:
       name: "en*"
     addresses:
-      - ${NEXT_IP}/24
+      - ${NEXT_IP}/${CIDR_PREFIX}
     routes:
       - to: default
         via: ${GATEWAY}
@@ -448,7 +490,7 @@ ok "Cloud-init configured (password only stored as a hash — no --cipassword)"
 
 # --- 13. Optional: register a DHCP reservation on your router --------------------
 step "Registering DHCP reservation (skipped automatically if not configured)"
-register_dhcp_reservation "$SELECTED_IFACE" "$NEXT_IP" "$VM_NAME" "$VM_MAC"
+register_dhcp_reservation "$SELECTED_NET" "$NEXT_IP" "$VM_NAME" "$VM_MAC"
 
 # --- 14. Snapshot (clean rollback point) ------------------------------------------
 # A snapshot taken right after first boot, before you've touched anything —
@@ -543,7 +585,9 @@ echo -e "  ${C_GREEN}✔  VM READY${C_RST}"
 sep
 echo -e "  ${C_WHITE}Name      ${C_RST}  $VM_NAME  ${C_DIM}(VMID $VMID)${C_RST}"
 echo -e "  ${C_WHITE}Ubuntu    ${C_RST}  $UBUNTU_VER"
-echo -e "  ${C_WHITE}IP        ${C_RST}  ${C_GREEN}$NEXT_IP${C_RST}  ${C_DIM}(static · gw $GATEWAY)${C_RST}"
+VLAN_SUFFIX=""
+[[ -n "$VLAN_TAG" && "$VLAN_TAG" != "0" ]] && VLAN_SUFFIX=" · VLAN $VLAN_TAG"
+echo -e "  ${C_WHITE}IP        ${C_RST}  ${C_GREEN}$NEXT_IP/${CIDR_PREFIX}${C_RST}  ${C_DIM}(static · gw ${GATEWAY}${VLAN_SUFFIX})${C_RST}"
 echo -e "  ${C_WHITE}RAM/Disk  ${C_RST}  ${VM_MEMORY} MB · $DISK_SIZE"
 echo -e "  ${C_WHITE}Lab type  ${C_RST}  $LAB_TYPE"
 echo -e "  ${C_WHITE}User      ${C_RST}  $USERNAME"

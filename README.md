@@ -49,13 +49,38 @@ optional — skip a section below if you don't need it.
    | `BRIDGE` | Your Linux bridge (`ip link` to list them) |
    | `DNS_SERVER` | DNS server new VMs should use |
    | `TEMPLATE_n_ID` / `TEMPLATE_n_LABEL` | The template IDs from the prerequisite step |
-   | `IFACE_PREFIX` / `IFACE_GW` | One entry per subnet/VLAN you want to offer — `[name]="192.168.1"` and `[name]="192.168.1.1"` |
-   | `IP_SCAN_RANGE_START` / `_END` | The range the ping sweep checks for a free address |
+   | `NETWORKS` | One entry per subnet/VLAN you want to offer — see below |
 
 3. That's it for a minimal setup — run it:
    ```bash
    bash new-vm.sh
    ```
+
+## Configuring `NETWORKS` (real subnetting, real VLANs)
+
+Each entry is `[name]="vlan_tag:cidr:gateway"`:
+
+```bash
+declare -A NETWORKS=(
+  [lan]="0:192.168.1.0/24:192.168.1.1"      # flat, untagged network
+  [servers]="10:10.10.10.0/24:10.10.10.1"   # VLAN 10, its own /24
+  [dmz]="20:10.10.20.0/27:10.10.20.1"       # VLAN 20, a smaller /27
+)
+```
+
+- **`vlan_tag`** — leave it `0` (or blank) for an untagged network on a flat
+  bridge. Set it to a real VLAN ID (e.g. `20`) if `BRIDGE` is a trunk port —
+  the script adds `tag=<id>` to the VM's network card, so Proxmox itself
+  tags the traffic; you don't need a separate bridge per VLAN.
+- **`cidr`** — any prefix length works, not just `/24`. The script derives
+  the actual usable host range from it (a `/27` gets 30 addresses checked
+  by the ping sweep, not 254), and writes that same prefix into the VM's
+  own network config — so a VM on a `/27` correctly gets a `/27` mask, not
+  a hardcoded `/24` that would be wrong for its subnet.
+- **`gateway`** — the router's address inside that subnet.
+
+Add as many entries as you have VLANs; they all show up as numbered choices
+when the script runs.
 
 ## Optional: Tailscale
 
