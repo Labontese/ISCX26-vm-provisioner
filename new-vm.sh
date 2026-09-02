@@ -518,12 +518,45 @@ if [[ -n "${CF_API_TOKEN:-}" ]]; then
   echo
   read -rp "  Expose this VM via Cloudflare Tunnel? (y/N): " CF_EXPOSE
   if [[ "${CF_EXPOSE,,}" == "y" ]]; then
-    read -rp "  Subdomain (e.g. myapp -> myapp.${CF_DOMAIN}): " CF_SUBDOMAIN
-    read -rp "  Protocol + port (e.g. http or https, default 80): " CF_PROTO
-    CF_PROTO="${CF_PROTO:-http}"
-    CF_SERVICE="${CF_PROTO}://${NEXT_IP}:$([ "$CF_PROTO" = "https" ] && echo 443 || echo 80)"
-    read -rp "  Different port? (Enter for default): " CF_PORT_OVERRIDE
-    [[ -n "$CF_PORT_OVERRIDE" ]] && CF_SERVICE="${CF_PROTO}://${NEXT_IP}:${CF_PORT_OVERRIDE}"
+    # Subdomain: valid DNS label characters only, no spaces/dots/etc.
+    while true; do
+      read -rp "  Subdomain (e.g. myapp -> myapp.${CF_DOMAIN}): " CF_SUBDOMAIN
+      [[ "$CF_SUBDOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] && break
+      warn "Invalid subdomain — letters, digits and hyphens only, no spaces or dots."
+    done
+
+    # Protocol is picked from a menu rather than free text — typing e.g.
+    # "ssh 22" as one answer to a free-text prompt builds a broken URL
+    # (protocol and port end up concatenated). A menu makes that impossible.
+    echo
+    echo -e "  ${C_WHITE}Protocol:${C_RST}"
+    echo -e "  ${C_DIM}[1]${C_RST}  http   (port 80)   ${C_DIM}default${C_RST}"
+    echo -e "  ${C_DIM}[2]${C_RST}  https  (port 443)"
+    echo -e "  ${C_DIM}[3]${C_RST}  ssh    (port 22)"
+    echo -e "  ${C_DIM}[4]${C_RST}  tcp    (enter a port manually)"
+    read -rp "  Choice [1]: " CF_PROTO_CHOICE
+    case "${CF_PROTO_CHOICE:-1}" in
+      1) CF_PROTO="http";  CF_PORT=80 ;;
+      2) CF_PROTO="https"; CF_PORT=443 ;;
+      3) CF_PROTO="ssh";   CF_PORT=22 ;;
+      4) CF_PROTO="tcp";   CF_PORT="" ;;
+      *) warn "Invalid choice, using http."; CF_PROTO="http"; CF_PORT=80 ;;
+    esac
+
+    read -rp "  Port [${CF_PORT:-enter a port}]: " CF_PORT_OVERRIDE
+    if [[ -n "$CF_PORT_OVERRIDE" ]]; then
+      if [[ "$CF_PORT_OVERRIDE" =~ ^[0-9]+$ ]]; then
+        CF_PORT="$CF_PORT_OVERRIDE"
+      else
+        warn "'${CF_PORT_OVERRIDE}' isn't a number — keeping port ${CF_PORT:-(none)}."
+      fi
+    fi
+    if [[ -z "$CF_PORT" ]]; then
+      err "A port is required for tcp."
+      exit 1
+    fi
+
+    CF_SERVICE="${CF_PROTO}://${NEXT_IP}:${CF_PORT}"
     CF_HOSTNAME="${CF_SUBDOMAIN}.${CF_DOMAIN}"
 
     step "Fetching current tunnel configuration"
